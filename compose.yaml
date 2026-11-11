@@ -1,0 +1,125 @@
+name: ${COMPOSE_PROJECT_NAME:-manga-reader}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+
+services:
+  openlist:
+    image: openlistteam/openlist:v4.2.9
+    user: '${HOST_UID:?Run ./setup.sh first}:${HOST_GID:?Run ./setup.sh first}'
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      UMASK: '077'
+      OPENLIST_ADMIN_PASSWORD: ${OPENLIST_ADMIN_PASSWORD:?Run ./setup.sh first}
+    volumes:
+      - ./data/openlist:/opt/openlist/data
+    ports:
+      - '127.0.0.1:${OPENLIST_PORT:-5244}:5244'
+    restart: unless-stopped
+    logging: *logging
+    networks: [cloud]
+
+  rclone:
+    image: rclone/rclone:1.76.0
+    command:
+      - serve
+      - nfs
+      - 'manga:漫画'
+      - --config=/config/rclone/rclone.conf
+      - --addr=0.0.0.0:2049
+      - --read-only
+      - --cache-dir=/memory-cache
+      - --nfs-cache-type=disk
+      - --nfs-cache-dir=/cache/nfs-handles
+      - --vfs-cache-mode=full
+      - --vfs-cache-max-size=256M
+      - --vfs-cache-max-age=2m
+      - --vfs-cache-poll-interval=10s
+      - --vfs-cache-min-free-space=64M
+      - --vfs-read-chunk-size=8M
+      - --vfs-read-chunk-size-limit=64M
+      - --buffer-size=8M
+      - --dir-cache-time=30m
+      - --poll-interval=0
+      - --log-level=NOTICE
+    volumes:
+      - ./config/rclone:/config/rclone:ro
+      - rclone_cache:/cache
+    tmpfs:
+      - /memory-cache:size=1073741824,mode=1777
+    depends_on: [openlist]
+    healthcheck:
+      test: [CMD-SHELL, "awk '$$2 ~ /:0801$$/ && $$4 == \"0A\" {ready=1} END {exit !ready}' /proc/net/tcp /proc/net/tcp6"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    restart: unless-stopped
+    logging: *logging
+    networks:
+      cloud:
+        ipv4_address: ${RCLONE_NFS_IP:-172.30.88.3}
+
+  suwayomi:
+    image: manga-reader/suwayomi:2.4.2366-cachefix1
+    build:
+      context: ./build/suwayomi
+    user: '${HOST_UID:?Run ./setup.sh first}:${HOST_GID:?Run ./setup.sh first}'
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      JAVA_TOOL_OPTIONS: '-Xmx1g'
+    volumes:
+      - ./data/suwayomi:/home/suwayomi/.local/share/Tachidesk
+      - cloud_manga:/remote:ro
+    ports:
+      - '127.0.0.1:${SUWAYOMI_PORT:-4567}:4567'
+    depends_on:
+      rclone:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+    networks: [cloud]
+
+  indexer:
+    image: rclone/rclone:1.76.0
+    entrypoint: ['/bin/sh', '/scripts/scheduled-refresh.sh']
+    user: '${HOST_UID:?Run ./setup.sh first}:${HOST_GID:?Run ./setup.sh first}'
+    environment:
+      MANGA_REMOTE: /remote
+      MANGA_LIBRARY: /library
+      INDEX_INTERVAL_SECONDS: '3600'
+      INDEX_RETRY_SECONDS: '300'
+    volumes:
+      - ./data/suwayomi/local:/library
+      - ./scripts:/scripts:ro
+      - cloud_manga:/remote:ro
+    network_mode: none
+    depends_on:
+      rclone:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, 'test -s /tmp/manga-index-last-success && now=$$(date +%s) && last=$$(cat /tmp/manga-index-last-success) && test $$((now-last)) -lt 7500']
+      interval: 2m
+      timeout: 5s
+      retries: 2
+      start_period: 3m
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  rclone_cache:
+  cloud_manga:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: 'addr=${RCLONE_NFS_IP:-172.30.88.3},nfsvers=3,port=2049,mountport=2049,tcp,nolock,ro,soft,timeo=30,retrans=2'
+      device: ':/'
+
+networks:
+  cloud:
+    ipam:
+      config:
+        - subnet: ${MANGA_SUBNET:-172.30.88.0/24}

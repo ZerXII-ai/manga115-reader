@@ -1,0 +1,4 @@
+**
+!build/
+!build/suwayomi/
+!build/suwayomi/Dockerfile

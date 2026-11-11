@@ -1,0 +1,37 @@
+# Default-deny: publish only reviewed project files.
+/*
+!/.gitignore
+!/.dockerignore
+!/README.md
+!/LICENSE
+!/LICENSE-NOTICE.md
+!/compose.yaml
+!/manga.sh
+!/setup.sh
+!/scripts/
+!/build/
+!/docs/
+
+/scripts/*
+!/scripts/*.sh
+!/scripts/*.py
+/build/*
+!/build/suwayomi/
+/build/suwayomi/*
+!/build/suwayomi/Dockerfile
+!/build/suwayomi/.dockerignore
+!/build/suwayomi/rarfix/
+/build/suwayomi/rarfix/*
+!/build/suwayomi/rarfix/*.java
+!/build/suwayomi/rarfix/*.py
+/docs/*
+!/docs/images/
+/docs/images/*
+!/docs/images/*.png
+
+# Never commit runtime state, secrets, generated archives, or local data.
+**/__pycache__/
+*.jar
+*.db
+*.sqlite*
+*.log
