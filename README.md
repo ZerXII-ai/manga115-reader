@@ -90,6 +90,7 @@ Rclone 正文缓存使用容器内 `tmpfs`，不作为持久正文卷保存；�
 - 本地源没有作品：先确认 OpenList 存储正常，再运行 `./manga.sh refresh` 并刷新本地源；检查目录结构及根目录 RAR 限制。
 - 页面加载失败：查看 `./manga.sh logs suwayomi` 和 `./manga.sh logs rclone`，检查 115 授权、云盘文件格式和网络。首次读取大卷可能较慢；同一 RAR 卷的图片请求可能排队，降低阅读器预载数量可能有帮助。
 - 自动索引失败：查看 `./manga.sh status` 和 `./manga.sh logs indexer`。健康状态仅反映扫描情况，不等于所有漫画都可读；此容器不主动发送通知。
+- 若 OpenList 日志持续出现 `SQLITE_BUSY` 或 `database is locked`，同时访问出现认证错误或限流，先停止反复重试并检查数据库及存储状态。曾在 OrbStack 的实际部署中观察到这些症状，但尚未确认原因；短时隔离测试不能证明长期稳定。处理前应妥善备份包含授权信息的 `data/openlist/`，注意备份同样需要保密；不要随意用旧备份覆盖可能已经轮换的令牌。
 - 端口或 Docker 网段冲突：在 `.env` 中设置 `OPENLIST_PORT`、`SUWAYOMI_PORT`，或同时设置匹配的 `MANGA_SUBNET` 和 `RCLONE_NFS_IP`。更改网段时，现有 Docker NFS 卷可能仍记住旧地址：先运行 `docker compose down`（不要加 `-v`），用 `docker volume inspect` 确认项目的 `cloud_manga` 卷是 NFS 挂载配置，再仅删除该卷并重新运行 `./manga.sh start`。默认项目名时，卷名为 `manga-reader_cloud_manga`；自定义项目名时需先核实卷名。不要删除其他卷或 `data/` 目录。`.env` 含密码，不要提交或分享。
 - 凭据过期：按官方流程重新授权；刷新令牌可能轮换，不要反复导入旧备份。
 
