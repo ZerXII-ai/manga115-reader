@@ -17,6 +17,12 @@
 !/scripts/*.py
 /build/*
 !/build/suwayomi/
+!/build/openlist/
+/build/openlist/*
+!/build/openlist/Dockerfile
+!/build/openlist/.dockerignore
+!/build/openlist/LICENSE-AGPL-3.0
+!/build/openlist/*.patch
 /build/suwayomi/*
 !/build/suwayomi/Dockerfile
 !/build/suwayomi/.dockerignore

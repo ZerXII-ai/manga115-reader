@@ -12,9 +12,9 @@
 ## 准备
 
 - macOS，已安装并启动 [OrbStack](https://orbstack.dev/)；其他 Docker 环境尚未做完整验证。
-- Docker Compose、Python 3.9 或更新版、JDK 17 或更新版（需要 `java` 和 `javac`）。Mac 上可使用 `brew install openjdk@17`；如果不在 PATH，可设置 `JDK_BIN` 为其 `bin` 目录。
+- Docker Compose、Git、Python 3.9 或更新版、JDK 17 或更新版（需要 `java` 和 `javac`）。Mac 上可使用 `brew install openjdk@17`；如果不在 PATH，可设置 `JDK_BIN` 为其 `bin` 目录。OpenList 使用 Go 容器构建，无需在 Mac 上安装 Go。
 - 115 账号及准备好的漫画目录；运行时需能访问 OpenList、115、Docker 镜像仓库和 GitHub 发行版。
-- 为首次下载约 174 MiB 的官方 JAR、生成补丁及运行容器预留空间与内存。Java 堆上限为 1 GiB，Rclone 使用最多 1 GiB 的临时文件系统，实际内存压力与漫画及并发量有关。
+- 首次构建需要下载约 174 MiB 的官方 JAR、OpenList 源码和界面，以及 Go 镜像与依赖；网络较慢时可能需要较长时间。Java 堆上限为 1 GiB，Rclone 使用最多 1 GiB 的临时文件系统，实际内存压力与漫画及并发量有关。
 
 ## 1. 初始化本机配置
 
@@ -26,6 +26,8 @@
 ```
 
 初始化会生成随机 OpenList 管理员密码和 Rclone 配置；如果本地配置已存在，脚本会停止并保留原文件。需要登录 OpenList 时，在**自己的终端**运行 `./manga.sh password` 查看密码。此密码、项目内 `.env` 和 `config/` 都应保密，勿放入截图或 Issue。
+
+首次启动 OpenList 会克隆固定版本源码、校验官方界面压缩包、应用本仓库补丁并在 Docker 中执行相关测试和构建。生成的源码、依赖与镜像不会提交到 Git。
 
 ## 2. 在 OpenList 中连接 115
 
@@ -50,11 +52,20 @@ Rclone 的 WebDAV 配置在 `./setup.sh` 中自动生成，使用容器内的 `o
 
 首次启动会从 Suwayomi 官方发行版下载固定版本 JAR、校验 SHA-256，并在本机编译补丁后构建镜像；JAR 和生成文件不会提交到 Git。打开 [Suwayomi](http://127.0.0.1:4567)，进入 **Browse → Local source**，搜索作品并打开卷；可按需加入 Library。
 
+Suwayomi 第一次启动并能打开网页后，执行以下命令，启用与本部署一致的正文页缓存修复：
+
+```sh
+./manga.sh protect-cache
+```
+
+该命令先验证内置 WebUI 版本，再停止并短暂重启 Suwayomi；它将正文请求设为不使用持久缓存，新服务工作线程激活时只清理旧的正文页缓存，保留封面缓存规则。原工作线程和配置备份在私有 `backups/` 中。命令将 WebUI 模式设为 `CUSTOM`，因此以后需要手动管理 WebUI 更新；若文件与已验证版本不匹配，命令会停止而不覆盖。完成后重新打开阅读器，等待几秒并刷新页面，让新工作线程生效。
+
 ```sh
 ./manga.sh status              # 查看容器和索引健康状态
 ./manga.sh refresh             # 手动刷新目录缓存和本地索引
 ./manga.sh logs indexer        # 查看自动扫描日志
 ./manga.sh logs openlist       # 查看 OpenList 日志
+./manga.sh protect-cache       # 对受支持的 WebUI 安装正文缓存修复
 ./manga.sh stop                # 停止容器，保留数据
 ```
 
@@ -83,19 +94,27 @@ Rclone 的 WebDAV 配置在 `./setup.sh` 中自动生成，使用容器内的 `o
 
 索引容器启动后扫描一次，此后每轮成功完成约一小时后再扫描。失败时逐步退避重试，最多一小时。容器没有 Docker socket 或容器网络，云盘只读；Mac 和 OrbStack 必须运行。Rclone 与 OpenList 有目录缓存，新内容可能晚于下一次扫描出现。已有作品新增卷后，如章节列表未更新，可在作品页面刷新章节。
 
-Rclone 正文缓存使用容器内 `tmpfs`，不作为持久正文卷保存；浏览器、虚拟机和操作系统的缓存或交换空间由各自管理，不能据此保证所有读取都完全不写磁盘。封面、书架和进度保存在 `data/suwayomi/`；OpenList 授权信息保存在 `data/openlist/`。Rclone 的 256 MiB 缓存大小是回收目标，打开中的文件可能超过该目标；参见 [Rclone NFS 文档](https://rclone.org/commands/rclone_serve_nfs/)。
+Rclone 正文缓存使用容器内 `tmpfs`，不作为持久正文卷保存。启用上述 WebUI 缓存修复后，阅读器的正文页请求绕过浏览器持久缓存；浏览器、虚拟机和操作系统的其他缓存或交换空间由各自管理，不能据此保证所有读取都完全不写磁盘。封面、书架和进度保存在 `data/suwayomi/`；本模板的 OpenList 授权信息保存在 `data/openlist/`。Rclone 的 256 MiB 缓存大小是回收目标，打开中的文件可能超过该目标；参见 [Rclone NFS 文档](https://rclone.org/commands/rclone_serve_nfs/)。
+
+## 从旧版升级
+
+旧版使用 OpenList 官方 v4.2.9 镜像；本版本改为在同一数据目录上运行本地构建的修复镜像。升级前先运行 `./manga.sh stop`，完整备份 `data/openlist/`（包括数据库、可能存在的 `-wal` / `-shm` 文件与配置），并保护好备份，因为其中包含授权信息。随后更新代码，执行 `./manga.sh start`，再按上文执行 `./manga.sh protect-cache`。不要用旧数据库或刷新令牌覆盖已经运行和轮换令牌的新数据库；如有需要，请重新授权。
+
+本模板保留原来的 OpenList 绑定目录，以避免升级时悄悄切换到空数据库。另一种部署方式是把 OpenList 数据迁移到 Docker 命名卷；实际部署曾使用该方式，迁移本身不能保证消除锁库，且必须在停机、完整备份和核对属主后进行。
 
 ## 排障
 
 - 本地源没有作品：先确认 OpenList 存储正常，再运行 `./manga.sh refresh` 并刷新本地源；检查目录结构及根目录 RAR 限制。
 - 页面加载失败：查看 `./manga.sh logs suwayomi` 和 `./manga.sh logs rclone`，检查 115 授权、云盘文件格式和网络。首次读取大卷可能较慢；同一 RAR 卷的图片请求可能排队，降低阅读器预载数量可能有帮助。
 - 自动索引失败：查看 `./manga.sh status` 和 `./manga.sh logs indexer`。健康状态仅反映扫描情况，不等于所有漫画都可读；此容器不主动发送通知。
-- 若 OpenList 日志持续出现 `SQLITE_BUSY` 或 `database is locked`，同时访问出现认证错误或限流，先停止反复重试并检查数据库及存储状态。曾在 OrbStack 的实际部署中观察到这些症状，但尚未确认原因；短时隔离测试不能证明长期稳定。处理前应妥善备份包含授权信息的 `data/openlist/`，注意备份同样需要保密；不要随意用旧备份覆盖可能已经轮换的令牌。
+- 若 OpenList 日志持续出现 `SQLITE_BUSY` 或 `database is locked`，同时访问出现认证错误或限流，先停止反复重试并检查数据库及存储状态。修复版针对上游报告的 WebDAV 事务锁和令牌保存问题，但短时测试不能证明长期稳定。处理前应完整备份 `data/openlist/` 并保护备份；不要随意导入可能已经轮换的旧令牌。
 - 端口或 Docker 网段冲突：在 `.env` 中设置 `OPENLIST_PORT`、`SUWAYOMI_PORT`，或同时设置匹配的 `MANGA_SUBNET` 和 `RCLONE_NFS_IP`。更改网段时，现有 Docker NFS 卷可能仍记住旧地址：先运行 `docker compose down`（不要加 `-v`），用 `docker volume inspect` 确认项目的 `cloud_manga` 卷是 NFS 挂载配置，再仅删除该卷并重新运行 `./manga.sh start`。默认项目名时，卷名为 `manga-reader_cloud_manga`；自定义项目名时需先核实卷名。不要删除其他卷或 `data/` 目录。`.env` 含密码，不要提交或分享。
 - 凭据过期：按官方流程重新授权；刷新令牌可能轮换，不要反复导入旧备份。
 
 ## 验证边界与许可
 
-本仓库补丁针对固定的 Suwayomi v2.4.2366，用于修复本地 RAR 单页读取阻塞和章节页流缓存缺失。它不是上游官方补丁，单页 RAR 内存解码有 128 MiB 限制；真实压缩包的格式、网络和阅读器行为仍需自行验证。部署链路已在 OrbStack 的隔离环境中使用合成 ZIP 和本地 OpenList 存储验证；真实 115 OAuth 和不同平台的兼容性并未在该隔离环境中验证。
+本仓库的 OpenList 修复基于固定的 v4.2.9，并适配了上游尚待审查的 [WebDAV 修复](https://github.com/OpenListTeam/OpenList/pull/3342)和[令牌保存修复](https://github.com/OpenListTeam/OpenList/pull/3344)。它们不是已合并的官方版本；首次构建会执行相关包测试。实际 115 环境已短时恢复，但长期稳定性仍需观察。
+
+Suwayomi 补丁针对固定的 v2.4.2366，用于修复本地 RAR 单页读取阻塞和章节页流缓存缺失。它不是上游官方补丁，单页 RAR 内存解码有 128 MiB 限制；真实压缩包的格式、网络和阅读器行为仍需自行验证。部署链路已在 OrbStack 的隔离环境中使用合成 ZIP 和本地 OpenList 存储验证；真实 115 OAuth 和不同平台的兼容性并未在该隔离环境中验证。正文缓存修复的浏览器工作线程已通过本地逻辑测试；浏览器是否已激活新工作线程需在使用设备上确认。
 
 许可、上游项目及第三方组件说明见 [LICENSE-NOTICE.md](LICENSE-NOTICE.md)。

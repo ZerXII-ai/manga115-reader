@@ -8,7 +8,9 @@ x-logging: &logging
 
 services:
   openlist:
-    image: openlistteam/openlist:v4.2.9
+    image: manga-reader/openlist:v4.2.9-webdavfix
+    build:
+      context: ./build/openlist
     user: '${HOST_UID:?Run ./setup.sh first}:${HOST_GID:?Run ./setup.sh first}'
     environment:
       TZ: ${TZ:-Asia/Shanghai}

@@ -1,0 +1,603 @@
+diff --git a/drivers/115_open/driver.go b/drivers/115_open/driver.go
+index 13673eb..46829fa 100644
+--- a/drivers/115_open/driver.go
++++ b/drivers/115_open/driver.go
+@@ -40,17 +40,45 @@ func (d *Open115) GetAddition() driver.Additional {
+ 	return &d.Addition
+ }
+ 
++// onTokenRefreshed persists the rotated token pair. 115 Open refresh tokens are
++// single use: once a new one is issued the previous one is rejected, so a lost
++// write would leave the storage broken after a restart.
++//
++// The SDK assigns the response to its own fields before invoking this callback,
++// so an empty refresh token in the response would also clear the value used by
++// the next refresh request. Restore both states from the addition, which keeps
++// the last usable token when the field is missing.
++func (d *Open115) onTokenRefreshed(accessToken, refreshToken string) {
++	if accessToken != "" {
++		d.Addition.AccessToken = accessToken
++	}
++	if refreshToken != "" {
++		d.Addition.RefreshToken = refreshToken
++	}
++	if d.client != nil {
++		d.client.SetAccessToken(d.Addition.AccessToken)
++		d.client.SetRefreshToken(d.Addition.RefreshToken)
++	}
++	op.MustSaveDriverStorage(d)
++}
++
+ func (d *Open115) Init(ctx context.Context) error {
++	if d.Addition.AccessToken == "" && d.Addition.RefreshToken == "" {
++		return errors.New("access token or refresh token is required")
++	}
+ 	d.client = sdk.New(sdk.WithRefreshToken(d.Addition.RefreshToken),
+ 		sdk.WithAccessToken(d.Addition.AccessToken),
+-		sdk.WithOnRefreshToken(func(s1, s2 string) {
+-			d.Addition.AccessToken = s1
+-			d.Addition.RefreshToken = s2
+-			op.MustSaveDriverStorage(d)
+-		}))
++		sdk.WithOnRefreshToken(d.onTokenRefreshed))
+ 	if flags.Debug || flags.Dev {
+ 		d.client.SetDebug(true)
+ 	}
++	if d.Addition.AccessToken == "" {
++		// Without an access token the SDK would send an unauthenticated request
++		// first and only then refresh, surfacing a misleading "40100000 参数错误".
++		if _, err := d.client.RefreshToken(ctx); err != nil {
++			return err
++		}
++	}
+ 	_, err := d.client.UserInfo(ctx)
+ 	if err != nil {
+ 		return err
+diff --git a/internal/bootstrap/sqlite_driver_glebarez.go b/internal/bootstrap/sqlite_driver_glebarez.go
+index a45a8ba..93e9f61 100644
+--- a/internal/bootstrap/sqlite_driver_glebarez.go
++++ b/internal/bootstrap/sqlite_driver_glebarez.go
+@@ -3,10 +3,76 @@
+ package bootstrap
+ 
+ import (
++	"net/url"
++	"strings"
++
+ 	"github.com/glebarez/sqlite"
+ 	"gorm.io/gorm"
+ )
+ 
+ func openSQLite(dsn string) gorm.Dialector {
+-	return sqlite.Open(dsn)
++	return sqlite.Open(normalizeGlebarezSQLiteDSN(dsn))
++}
++
++// normalizeGlebarezSQLiteDSN translates mattn/go-sqlite3 style query parameters
++// (_journal, _vacuum) into the _pragma syntax required by github.com/glebarez/go-sqlite
++// (modernc.org/sqlite), and configures busy_timeout and immediate transaction locking
++// for file-backed databases to prevent SQLITE_BUSY under concurrent WebDAV/API access.
++func normalizeGlebarezSQLiteDSN(dsn string) string {
++	base, rawQuery, hasQuery := strings.Cut(dsn, "?")
++	if !hasQuery {
++		return dsn
++	}
++	q, err := url.ParseQuery(rawQuery)
++	if err != nil {
++		return dsn
++	}
++
++	existingPragmas := q["_pragma"]
++	hasJournal := false
++	hasVacuum := false
++	hasBusyTimeout := false
++	for _, p := range existingPragmas {
++		lower := strings.ToLower(strings.TrimSpace(p))
++		switch {
++		case strings.HasPrefix(lower, "journal_mode"):
++			hasJournal = true
++		case strings.HasPrefix(lower, "auto_vacuum"):
++			hasVacuum = true
++		case strings.HasPrefix(lower, "busy_timeout"):
++			hasBusyTimeout = true
++		}
++	}
++
++	journal := q.Get("_journal")
++	q.Del("_journal")
++	vacuum := q.Get("_vacuum")
++	q.Del("_vacuum")
++
++	isMemory := strings.Contains(base, ":memory:") || strings.EqualFold(q.Get("mode"), "memory")
++
++	var pragmas []string
++	if !isMemory && !hasBusyTimeout {
++		pragmas = append(pragmas, "busy_timeout(10000)")
++	}
++	if journal != "" && !hasJournal {
++		pragmas = append(pragmas, "journal_mode("+journal+")")
++	}
++	if vacuum != "" && !hasVacuum {
++		pragmas = append(pragmas, "auto_vacuum("+vacuum+")")
++	}
++	pragmas = append(pragmas, existingPragmas...)
++	if len(pragmas) > 0 {
++		q["_pragma"] = pragmas
++	}
++
++	if !isMemory && q.Get("_txlock") == "" {
++		q.Set("_txlock", "immediate")
++	}
++
++	encoded := q.Encode()
++	if encoded == "" {
++		return base
++	}
++	return base + "?" + encoded
+ }
+diff --git a/internal/op/storage.go b/internal/op/storage.go
+index 42b8c9d..cb172f3 100644
+--- a/internal/op/storage.go
++++ b/internal/op/storage.go
+@@ -295,6 +295,40 @@ func MustSaveDriverStorage(driver driver.Driver) {
+ 	}
+ }
+ 
++// Retrying is required because several drivers persist rotating credentials
++// here (115 Open, PikPak, OneDrive...). The server invalidates the previous
++// token as soon as a new one is issued, so a lost write leaves the storage with
++// a permanently unusable token once the process restarts.
++const (
++	storageSaveAttempts  = 5
++	storageSaveBaseDelay = 200 * time.Millisecond
++)
++
++func isTransientDBError(err error) bool {
++	msg := strings.ToLower(err.Error())
++	return strings.Contains(msg, "database is locked") ||
++		strings.Contains(msg, "sqlite_busy") ||
++		strings.Contains(msg, "database table is locked")
++}
++
++func updateStorageWithRetry(storage *model.Storage) error {
++	var err error
++	delay := storageSaveBaseDelay
++	for attempt := 0; attempt < storageSaveAttempts; attempt++ {
++		if err = db.UpdateStorage(storage); err == nil {
++			return nil
++		}
++		if !isTransientDBError(err) {
++			return err
++		}
++		if attempt < storageSaveAttempts-1 {
++			time.Sleep(delay)
++			delay *= 2
++		}
++	}
++	return err
++}
++
+ func saveDriverStorage(driver driver.Driver) error {
+ 	storage := driver.GetStorage()
+ 	addition := driver.GetAddition()
+@@ -303,7 +337,7 @@ func saveDriverStorage(driver driver.Driver) error {
+ 		return errors.Wrap(err, "error while marshal addition")
+ 	}
+ 	storage.Addition = str
+-	err = db.UpdateStorage(storage)
++	err = updateStorageWithRetry(storage)
+ 	if err != nil {
+ 		return errors.WithMessage(err, "failed update storage in database")
+ 	}
+diff --git a/server/webdav/prop.go b/server/webdav/prop.go
+index 8fc0bae..ed5e0f4 100644
+--- a/server/webdav/prop.go
++++ b/server/webdav/prop.go
+@@ -172,9 +172,9 @@ var liveProps = map[xml.Name]struct {
+ // TODO(nigeltao) merge props and allprop?
+ 
+ // Props returns the status of the properties named pnames for resource name.
+-func props(tx *gorm.DB, ctx context.Context, ls LockSystem, name string, fi model.Obj, pnames []xml.Name) ([]Propstat, error) {
++func props(ctx context.Context, ls LockSystem, name string, fi model.Obj, pnames []xml.Name) ([]Propstat, error) {
+ 	isDir := fi.IsDir()
+-	deadProps, err := getDeadProps(tx, name)
++	deadProps, err := getDeadProps(ctx, name)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -199,9 +199,9 @@ func props(tx *gorm.DB, ctx context.Context, ls LockSystem, name string, fi mode
+ }
+ 
+ // Propnames returns the property names defined for resource name.
+-func propnames(tx *gorm.DB, name string, fi model.Obj) ([]xml.Name, error) {
++func propnames(ctx context.Context, name string, fi model.Obj) ([]xml.Name, error) {
+ 	isDir := fi.IsDir()
+-	deadProps, err := getDeadProps(tx, name)
++	deadProps, err := getDeadProps(ctx, name)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -218,8 +218,8 @@ func propnames(tx *gorm.DB, name string, fi model.Obj) ([]xml.Name, error) {
+ }
+ 
+ // Allprop returns the properties defined for resource name and the properties named in include.
+-func allprop(tx *gorm.DB, ctx context.Context, ls LockSystem, name string, fi model.Obj, include []xml.Name) ([]Propstat, error) {
+-	pnames, err := propnames(tx, name, fi)
++func allprop(ctx context.Context, ls LockSystem, name string, fi model.Obj, include []xml.Name) ([]Propstat, error) {
++	pnames, err := propnames(ctx, name, fi)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -232,7 +232,7 @@ func allprop(tx *gorm.DB, ctx context.Context, ls LockSystem, name string, fi mo
+ 			pnames = append(pnames, pn)
+ 		}
+ 	}
+-	return props(tx, ctx, ls, name, fi, pnames)
++	return props(ctx, ls, name, fi, pnames)
+ }
+ 
+ // Patch patches the properties of resource name.
+@@ -306,12 +306,16 @@ loop:
+ 	return []Propstat{pstat}, nil
+ }
+ 
+-func getDeadProps(tx *gorm.DB, path string) (map[xml.Name]Property, error) {
+-	var rows []model.WebDAVProperty
+-	if tx == nil {
+-		return nil, errors.New("webdav property transaction is not initialized")
++func getDeadProps(ctx context.Context, path string) (map[xml.Name]Property, error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	database := db.GetDb()
++	if database == nil {
++		return nil, errors.New("webdav property database is not initialized")
+ 	}
+-	if err := tx.Where("path = ?", path).Find(&rows).Error; err != nil {
++	var rows []model.WebDAVProperty
++	if err := database.WithContext(ctx).Where("path = ?", path).Find(&rows).Error; err != nil {
+ 		return nil, err
+ 	}
+ 	props := make(map[xml.Name]Property, len(rows))
+@@ -326,23 +330,26 @@ func getDeadProps(tx *gorm.DB, path string) (map[xml.Name]Property, error) {
+ }
+ 
+ func withDeadPropsTransaction(ctx context.Context, fn func(*gorm.DB) error) error {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
+ 	database := db.GetDb()
+ 	if database == nil {
+ 		return errors.New("webdav property database is not initialized")
+ 	}
+-	var transaction *gorm.DB
+-	err := database.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+-		transaction = tx
++	return database.Transaction(func(tx *gorm.DB) error {
+ 		var probe int
+-		if err := tx.Raw("SELECT 1").Scan(&probe).Error; err != nil {
++		if err := tx.WithContext(ctx).Raw("SELECT 1").Scan(&probe).Error; err != nil {
+ 			return err
+ 		}
+-		return fn(tx)
++		if err := fn(tx.WithContext(ctx)); err != nil {
++			return err
++		}
++		return ctx.Err()
+ 	})
+-	if err != nil && transaction != nil {
+-		_ = transaction.Rollback().Error
+-	}
+-	return err
+ }
+ 
+ func escapeXML(s string) string {
+diff --git a/server/webdav/webdav.go b/server/webdav/webdav.go
+index d2d8740..4c630ea 100644
+--- a/server/webdav/webdav.go
++++ b/server/webdav/webdav.go
+@@ -29,7 +29,6 @@ import (
+ 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+ 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+ 	"github.com/OpenListTeam/OpenList/v4/server/common"
+-	"gorm.io/gorm"
+ )
+ 
+ type Handler struct {
+@@ -893,44 +892,41 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
+ 
+ 	mw := multistatusWriter{w: w}
+ 
+-	err = withDeadPropsTransaction(ctx, func(tx *gorm.DB) error {
+-		walkFn := func(currentPath string, info model.Obj, walkErr error) error {
+-			if walkErr != nil {
+-				return walkErr
+-			}
+-			var pstats []Propstat
+-			if pf.Propname != nil {
+-				pnames, err := propnames(tx, currentPath, info)
+-				if err != nil {
+-					return err
+-				}
+-				pstat := Propstat{Status: http.StatusOK}
+-				for _, xmlname := range pnames {
+-					pstat.Props = append(pstat.Props, Property{XMLName: xmlname})
+-				}
+-				pstats = append(pstats, pstat)
+-			} else if pf.Allprop != nil {
+-				pstats, walkErr = allprop(tx, ctx, h.LockSystem, currentPath, info, pf.Prop)
+-			} else {
+-				pstats, walkErr = props(tx, ctx, h.LockSystem, currentPath, info, pf.Prop)
+-			}
+-			if walkErr != nil {
+-				return walkErr
++	walkFn := func(currentPath string, info model.Obj, walkErr error) error {
++		if walkErr != nil {
++			return walkErr
++		}
++		var pstats []Propstat
++		if pf.Propname != nil {
++			pnames, err := propnames(ctx, currentPath, info)
++			if err != nil {
++				return err
+ 			}
+-			href := path.Join(h.Prefix, strings.TrimPrefix(currentPath, user.BasePath))
+-			if href != "/" && info.IsDir() {
+-				href += "/"
++			pstat := Propstat{Status: http.StatusOK}
++			for _, xmlname := range pnames {
++				pstat.Props = append(pstat.Props, Property{XMLName: xmlname})
+ 			}
+-			return mw.write(makePropstatResponse(href, pstats))
++			pstats = append(pstats, pstat)
++		} else if pf.Allprop != nil {
++			pstats, walkErr = allprop(ctx, h.LockSystem, currentPath, info, pf.Prop)
++		} else {
++			pstats, walkErr = props(ctx, h.LockSystem, currentPath, info, pf.Prop)
+ 		}
+-
+-		if walkErr := walkFS(ctx, depth, reqPath, fi, walkFn); walkErr != nil {
++		if walkErr != nil {
+ 			return walkErr
+ 		}
+-		return mw.close()
+-	})
+-	if err != nil {
+-		return http.StatusInternalServerError, err
++		href := path.Join(h.Prefix, strings.TrimPrefix(currentPath, user.BasePath))
++		if href != "/" && info.IsDir() {
++			href += "/"
++		}
++		return mw.write(makePropstatResponse(href, pstats))
++	}
++
++	if walkErr := walkFS(ctx, depth, reqPath, fi, walkFn); walkErr != nil {
++		return http.StatusInternalServerError, walkErr
++	}
++	if closeErr := mw.close(); closeErr != nil {
++		return http.StatusInternalServerError, closeErr
+ 	}
+ 	return 0, nil
+ }
+diff --git a/drivers/115_open/driver_test.go b/drivers/115_open/driver_test.go
+new file mode 100644
+index 0000000..d15e83e
+--- /dev/null
++++ b/drivers/115_open/driver_test.go
+@@ -0,0 +1,129 @@
++package _115_open
++
++import (
++	"encoding/json"
++	"fmt"
++	"reflect"
++	"sync"
++	"testing"
++
++	sdk "github.com/OpenListTeam/115-sdk-go"
++	"github.com/OpenListTeam/OpenList/v4/internal/conf"
++	"github.com/OpenListTeam/OpenList/v4/internal/db"
++	"github.com/OpenListTeam/OpenList/v4/internal/model"
++	"github.com/glebarez/sqlite"
++	"gorm.io/gorm"
++)
++
++var (
++	setupDBOnce sync.Once
++	setupDBErr  error
++	rowSeq      int64
++)
++
++// setupTestDB mirrors internal/op/storage_test.go: an in-memory SQLite database
++// behind internal/db, so op.MustSaveDriverStorage really persists and the tests
++// can assert on the stored row.
++func setupTestDB(t *testing.T) {
++	t.Helper()
++	setupDBOnce.Do(func() {
++		var gormDB *gorm.DB
++		gormDB, setupDBErr = gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
++		if setupDBErr != nil {
++			return
++		}
++		conf.Conf = conf.DefaultConfig("testdata")
++		db.Init(gormDB)
++	})
++	if setupDBErr != nil {
++		t.Fatalf("failed to set up test database: %v", setupDBErr)
++	}
++}
++
++func newTestDriver(t *testing.T, accessToken, refreshToken string) *Open115 {
++	t.Helper()
++	setupTestDB(t)
++	rowSeq++
++	addition, err := json.Marshal(Addition{AccessToken: accessToken, RefreshToken: refreshToken})
++	if err != nil {
++		t.Fatalf("failed to marshal addition: %v", err)
++	}
++	row := &model.Storage{
++		Driver:    "115 Open",
++		MountPath: fmt.Sprintf("/115open-test-%d", rowSeq),
++		Addition:  string(addition),
++	}
++	if err := db.CreateStorage(row); err != nil {
++		t.Fatalf("failed to create storage row: %v", err)
++	}
++	d := &Open115{Storage: *row}
++	d.Addition.AccessToken = accessToken
++	d.Addition.RefreshToken = refreshToken
++	d.client = sdk.New(sdk.WithAccessToken(accessToken), sdk.WithRefreshToken(refreshToken))
++	d.client.SetOnRefreshToken(d.onTokenRefreshed)
++	return d
++}
++
++func persistedRefreshToken(t *testing.T, id uint) string {
++	t.Helper()
++	st, err := db.GetStorageById(id)
++	if err != nil {
++		t.Fatalf("failed to read storage back: %v", err)
++	}
++	var a Addition
++	if err := json.Unmarshal([]byte(st.Addition), &a); err != nil {
++		t.Fatalf("failed to decode persisted addition %q: %v", st.Addition, err)
++	}
++	return a.RefreshToken
++}
++
++func clientField(t *testing.T, c *sdk.Client, name string) string {
++	t.Helper()
++	v := reflect.ValueOf(c).Elem().FieldByName(name)
++	if !v.IsValid() {
++		t.Fatalf("field %s not found on sdk.Client", name)
++	}
++	return v.String()
++}
++
++// The SDK assigns the response to its own fields before invoking the callback,
++// so an empty refresh token in the response must not survive in either the
++// persisted addition or the running client.
++func TestOnTokenRefreshedKeepsLastRefreshTokenWhenResponseOmitsIt(t *testing.T) {
++	d := newTestDriver(t, "old-access", "old-refresh")
++
++	// state the SDK leaves behind after a response without refresh_token
++	d.client.SetAccessToken("")
++	d.client.SetRefreshToken("")
++
++	d.onTokenRefreshed("new-access", "")
++
++	if got := persistedRefreshToken(t, d.ID); got != "old-refresh" {
++		t.Errorf("persisted refresh token = %q, want %q", got, "old-refresh")
++	}
++	if got := d.Addition.RefreshToken; got != "old-refresh" {
++		t.Errorf("addition refresh token = %q, want %q", got, "old-refresh")
++	}
++	if got := clientField(t, d.client, "refreshToken"); got != "old-refresh" {
++		t.Errorf("sdk refresh token = %q, want %q", got, "old-refresh")
++	}
++	if got := clientField(t, d.client, "accessToken"); got != "new-access" {
++		t.Errorf("sdk access token = %q, want %q", got, "new-access")
++	}
++}
++
++func TestOnTokenRefreshedStoresRotatedPair(t *testing.T) {
++	d := newTestDriver(t, "old-access", "old-refresh")
++
++	d.onTokenRefreshed("new-access", "new-refresh")
++
++	if got := persistedRefreshToken(t, d.ID); got != "new-refresh" {
++		t.Errorf("persisted refresh token = %q, want %q", got, "new-refresh")
++	}
++	if got := clientField(t, d.client, "refreshToken"); got != "new-refresh" {
++		t.Errorf("sdk refresh token = %q, want %q", got, "new-refresh")
++	}
++	if got := clientField(t, d.client, "accessToken"); got != "new-access" {
++		t.Errorf("sdk access token = %q, want %q", got, "new-access")
++	}
++}
+diff --git a/internal/bootstrap/sqlite_driver_glebarez_test.go b/internal/bootstrap/sqlite_driver_glebarez_test.go
+new file mode 100644
+index 0000000..638137d
+--- /dev/null
++++ b/internal/bootstrap/sqlite_driver_glebarez_test.go
+@@ -0,0 +1,78 @@
++//go:build !sqlite_cgo_compat && !(linux && (mips || mips64 || mips64le || mipsle || loong64)) && !(windows && 386)
++
++package bootstrap
++
++import (
++	"fmt"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"gorm.io/gorm"
++)
++
++func TestNormalizeGlebarezSQLiteDSN(t *testing.T) {
++	if got := normalizeGlebarezSQLiteDSN("file::memory:?cache=shared"); got != "file::memory:?cache=shared" {
++		t.Fatalf("memory DSN changed: got %q", got)
++	}
++
++	got := normalizeGlebarezSQLiteDSN("data/data.db?_journal=WAL&_vacuum=incremental")
++	for _, want := range []string{
++		"_pragma=busy_timeout%2810000%29",
++		"_pragma=journal_mode%28WAL%29",
++		"_pragma=auto_vacuum%28incremental%29",
++		"_txlock=immediate",
++	} {
++		if !strings.Contains(got, want) {
++			t.Fatalf("normalized DSN %q missing %q", got, want)
++		}
++	}
++	if strings.Contains(got, "_journal=") || strings.Contains(got, "_vacuum=") {
++		t.Fatalf("normalized DSN %q retained legacy mattn params", got)
++	}
++}
++
++func TestOpenSQLiteMigratesDeleteModeToWAL(t *testing.T) {
++	dbPath := filepath.Join(t.TempDir(), "data.db")
++
++	// Simulate a legacy database created in DELETE rollback journal mode.
++	legacyDB, err := gorm.Open(openSQLite(dbPath), &gorm.Config{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := legacyDB.Exec("PRAGMA journal_mode=DELETE; CREATE TABLE t (id INTEGER PRIMARY KEY);").Error; err != nil {
++		t.Fatal(err)
++	}
++	sqlLegacy, err := legacyDB.DB()
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = sqlLegacy.Close()
++
++	// Re-open with the standard bootstrap DSN and verify WAL + busy_timeout are active.
++	dB, err := gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental", dbPath)), &gorm.Config{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() {
++		if sqlDB, err := dB.DB(); err == nil {
++			_ = sqlDB.Close()
++		}
++	})
++
++	var journalMode string
++	if err := dB.Raw("PRAGMA journal_mode;").Scan(&journalMode).Error; err != nil {
++		t.Fatal(err)
++	}
++	if strings.ToLower(journalMode) != "wal" {
++		t.Fatalf("journal_mode = %q, want wal", journalMode)
++	}
++
++	var busyTimeout int
++	if err := dB.Raw("PRAGMA busy_timeout;").Scan(&busyTimeout).Error; err != nil {
++		t.Fatal(err)
++	}
++	if busyTimeout != 10000 {
++		t.Fatalf("busy_timeout = %d, want 10000", busyTimeout)
++	}
++}
